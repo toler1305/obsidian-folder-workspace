@@ -1,8 +1,14 @@
-/*
-
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
-
-If your plugin does not need CSS, delete this file.
-
-*/
+/* 1) Folders with a saved layout => bold + pointer */
+.has-folder-layout .nav-folder-title-content {
+    font-weight: bold;
+    text-decoration: none !important;
+    cursor: pointer;
+  }
+  
+  /* 2) If Ctrl is held down, all folder items do bold+pointer on hover */
+  .ctrl-active .nav-folder-title-content:hover {
+    font-weight: bold;
+    text-decoration: none !important;
+    cursor: pointer;
+  }
+  

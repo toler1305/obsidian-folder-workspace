@@ -1,170 +1,246 @@
 import {
 	App,
 	Plugin,
-	PluginSettingTab,
-	Setting,
 	TFile,
 	TFolder,
 	WorkspaceLeaf,
+	PluginSettingTab,
+	Setting,
 	Keymap,
 	Notice
 } from "obsidian";
 
-// How many files will open in vertical splits before switching to tabs
-const MAX_FILE_AMOUNT_TO_OPEN_AS_SPLIT_PANES = 5;
-
-/**
- * Define the plugin's settings interface.
- */
-interface FolderWorkspaceSettings {
-	openHotkey: "alt" | "mod" | "shift" | "ctrl";
-	saveHotkey: "alt" | "mod" | "shift" | "ctrl";
+interface FolderLayoutSettings {
+	saveModifier: "alt" | "mod" | "shift" | "ctrl";
+	defaultSplitThreshold: number;
+	sidebarHoldKey: "alt" | "mod" | "shift" | "ctrl";
 }
 
-const DEFAULT_SETTINGS: FolderWorkspaceSettings = {
-	openHotkey: "mod",
-	saveHotkey: "alt",
+const DEFAULT_SETTINGS: FolderLayoutSettings = {
+	saveModifier: "alt",
+	defaultSplitThreshold: 5,
+	sidebarHoldKey: "ctrl",
 };
 
-export default class FolderWorkspacePlugin extends Plugin {
-	private settings: FolderWorkspaceSettings;
+export default class FolderLayoutPlugin extends Plugin {
+	settings: FolderLayoutSettings;
+	observer: MutationObserver | null = null;
+	ctrlHeld: boolean = false; // (Optional) if you want separate Ctrl logic
+
+	/** Tracks if the “sidebar hold” key is currently pressed. */
+	private sidebarHeld: boolean = false;
 
 	async onload() {
-		console.log("Folder Workspace plugin loaded.");
-
-		// Load plugin settings
+		console.log("FolderLayoutPlugin loaded.");
 		await this.loadSettings();
-		this.addSettingTab(new FolderWorkspaceSettingTab(this.app, this));
+		this.addSettingTab(new FolderLayoutSettingTab(this.app, this));
 
-		// Listen for clicks in the file explorer
-		this.registerDomEvent(document, "click", (evt: MouseEvent) => {
-			const target = evt.target as HTMLElement;
-			const folderTitleEl = target?.closest(".nav-folder-title");
-			if (!folderTitleEl) return; // Not a folder in the explorer
-
-			const folderPath = folderTitleEl.getAttribute("data-path");
-			if (!folderPath) return;
-
-			const maybeFolder = this.app.vault.getAbstractFileByPath(folderPath);
-			if (!(maybeFolder instanceof TFolder)) return;
-
-			// Check which hotkey is used
-			if (this.isHotkey(evt, this.settings.saveHotkey)) {
-				// Save layout
-				evt.preventDefault();
-				evt.stopPropagation();
-				void this.saveFolderLayout(maybeFolder);
-			} else if (this.isHotkey(evt, this.settings.openHotkey)) {
-				// Open layout
-				evt.preventDefault();
-				evt.stopPropagation();
-				void this.openFolderLayout(maybeFolder);
+		// 1) Manage the "Sidebar Hold Key": forcibly open on keydown, close on keyup
+		this.registerDomEvent(document, "keydown", (evt: KeyboardEvent) => {
+			if (this.isSidebarHoldKey(evt) && !this.sidebarHeld) {
+				this.sidebarHeld = true;
+				this.forceShowLeftSidebar();
 			}
 		});
+		this.registerDomEvent(document, "keyup", (evt: KeyboardEvent) => {
+			if (!this.isSidebarHoldKey(evt) && this.sidebarHeld) {
+				this.sidebarHeld = false;
+				this.forceHideLeftSidebar();
+			}
+		});
+
+		// 2) (Optional) Keep existing Ctrl-based logic for “default layout”
+		this.registerDomEvent(document, "keydown", (evt: KeyboardEvent) => {
+			if (evt.ctrlKey && !this.ctrlHeld) {
+				this.ctrlHeld = true;
+				document.body.addClass("ctrl-active");
+				this.reloadHandlers();
+			}
+		});
+		this.registerDomEvent(document, "keyup", (evt: KeyboardEvent) => {
+			if (!evt.ctrlKey && this.ctrlHeld) {
+				this.ctrlHeld = false;
+				document.body.removeClass("ctrl-active");
+				this.reloadHandlers();
+			}
+		});
+
+		// 3) Observe changes in the file explorer
+		this.observer = new MutationObserver(() => this.reloadHandlers());
+		this.observer.observe(document.body, { childList: true, subtree: true });
+
+		// 4) Initial pass
+		this.reloadHandlers();
 	}
 
-	/** Determine if the user pressed the configured hotkey (alt, mod, shift, or ctrl). */
-	private isHotkey(evt: MouseEvent, hotkey: string): boolean {
-		switch (hotkey) {
-			case "alt":  return evt.altKey;
-			case "mod":  return Keymap.isModEvent(evt);
-			case "shift":return evt.shiftKey;
-			case "ctrl": return evt.ctrlKey; // Typically on Windows, but "mod" might handle that
-			default:     return false;
+	onunload() {
+		console.log("FolderLayoutPlugin unloaded.");
+		if (this.observer) this.observer.disconnect();
+	}
+
+	//-----------------------------------------
+	// 1) Hook folder DOM for custom click logic
+	//-----------------------------------------
+	private reloadHandlers() {
+		const folderTitleEls = document.querySelectorAll(
+			".nav-folder-title:not(.folder-layout-hooked)"
+		) as NodeListOf<HTMLElement>;
+
+		for (const titleEl of folderTitleEls) {
+			titleEl.addClass("folder-layout-hooked");
+			titleEl.onclick = (evt: MouseEvent) => this.handleFolderClick(evt, titleEl);
+
+			const folderPath = titleEl.getAttribute("data-path");
+			if (folderPath) {
+				this.updateFolderClass(folderPath);
+			}
 		}
 	}
 
-	/** Save the current layout to layout.json in the folder, but store file paths relative to that folder. */
-	private async saveFolderLayout(folder: TFolder) {
-		const openFilePaths = this.getOpenFilePaths();
-		const folderRoot = folder.path + "/";
+	/** If there's a layout.json => add .has-folder-layout, else remove it. */
+	private async updateFolderClass(folderPath: string) {
+		const layoutFilePath = `${folderPath}/layout.json`;
+		const hasLayout = await this.app.vault.adapter.exists(layoutFilePath);
 
-		// Ensure all open files are children of this folder
-		for (const filePath of openFilePaths) {
-			if (!filePath.startsWith(folderRoot)) {
-				new Notice(`All open files must be inside "${folder.name}".`);
+		const el = document.querySelector(
+			`.nav-folder-title[data-path="${CSS.escape(folderPath)}"]`
+		);
+		if (!el) return;
+
+		if (hasLayout) {
+			el.addClass("has-folder-layout");
+		} else {
+			el.removeClass("has-folder-layout");
+		}
+	}
+
+	//-----------------------------------------
+	// 2) The main folder click logic
+	//-----------------------------------------
+	/**
+	 * - If Ctrl is pressed => open *default* layout, ignoring any layout.json
+	 * - Else if user’s chosen “save modifier” => save layout
+	 * - Else if folder has a layout => open it
+	 * - Otherwise => let default expand/collapse happen
+	 */
+	private async handleFolderClick(evt: MouseEvent, titleEl: HTMLElement) {
+		const folderPath = titleEl.getAttribute("data-path");
+		if (!folderPath) return;
+		const folder = this.app.vault.getAbstractFileByPath(folderPath);
+		if (!(folder instanceof TFolder)) return;
+
+		// forcibly remove default click, then re-trigger
+		(evt.target as HTMLElement).onclick = null;
+		(evt.target as HTMLElement).click();
+
+	
+
+		if (this.isSaveModifierClick(evt)) {
+			evt.preventDefault();
+			evt.stopPropagation();
+
+			await this.saveFolderLayout(folder);
+			this.updateFolderClass(folder.path);
+			return;
+		}
+
+		const layoutFilePath = `${folder.path}/layout.json`;
+		const hasLayout = await this.app.vault.adapter.exists(layoutFilePath);
+
+        
+		if (hasLayout) {
+			evt.preventDefault();
+			evt.stopPropagation();
+
+			// await this.closeAllMarkdownLeaves();
+			await this.openSavedLayout(folder);
+			new Notice("Layout opened.");
+		} else {
+            if (evt.ctrlKey) {
+                evt.preventDefault();
+                evt.stopPropagation();
+    
+                // await this.closeAllMarkdownLeaves();
+                await this.openDefaultLayout(folder);
+                new Notice("Opened default layout.");
+                return;
+            }
+        }
+	}
+
+	private isSaveModifierClick(evt: MouseEvent): boolean {
+		switch (this.settings.saveModifier) {
+			case "alt":   return evt.altKey;
+			case "mod":   return Keymap.isModEvent(evt);
+			case "shift": return evt.shiftKey;
+			case "ctrl":  return evt.ctrlKey;
+		}
+		return false;
+	}
+
+	//-----------------------------------------
+	// 3) Save layout or load layout
+	//-----------------------------------------
+	private async saveFolderLayout(folder: TFolder) {
+		const folderRoot = folder.path + "/";
+		const openPaths = this.getOpenFilePaths();
+
+		for (const p of openPaths) {
+			if (!p.startsWith(folderRoot)) {
+				new Notice("All open files must be in this folder.");
 				return;
 			}
 		}
 
-		// Get entire workspace layout
 		const layoutObj = this.app.workspace.getLayout();
-		// Convert absolute paths to relative
 		this.makeLayoutPathsRelative(layoutObj, folder.path);
 
-		// Stringify layout
-		const layoutJson = JSON.stringify(layoutObj, null, 2);
+		const layoutString = JSON.stringify(layoutObj, null, 2);
 		const layoutFilePath = `${folder.path}/layout.json`;
 
 		try {
-			await this.app.vault.adapter.write(layoutFilePath, layoutJson);
+			await this.app.vault.adapter.write(layoutFilePath, layoutString);
 			new Notice("Layout saved.");
-		} catch (error) {
-			console.error(error);
+		} catch (err) {
+			console.error(err);
 			new Notice("Could not save layout.");
 		}
 	}
 
-	/** Open the layout if it exists; otherwise use the default layout. */
-	private async openFolderLayout(folder: TFolder) {
-		// Close all open tabs first
-		this.closeAllMarkdownLeaves();
-
-		// Check if layout.json exists
+	private async openSavedLayout(folder: TFolder) {
 		const layoutFilePath = `${folder.path}/layout.json`;
-		const exists = await this.app.vault.adapter.exists(layoutFilePath);
+		const layoutJson = await this.app.vault.adapter.read(layoutFilePath);
+		const newLayout = JSON.parse(layoutJson);
 
-		if (!exists) {
-			// No saved layout => open the folder in default layout
-			new Notice(`No saved layout found for "${folder.name}".`);
-			await this.openDefaultLayout(folder);
-			return;
-		}
+		this.makeLayoutPathsAbsolute(newLayout, folder.path);
 
-		try {
-			// Read the JSON from disk
-			const layoutJson = await this.app.vault.adapter.read(layoutFilePath);
-			const layoutObj = JSON.parse(layoutJson);
+		const currentLayout = this.app.workspace.getLayout();
+		newLayout.left = currentLayout.left;
+		newLayout.right = currentLayout.right;
+		newLayout["left-ribbon"] = currentLayout["left-ribbon"];
+		newLayout["right-ribbon"] = currentLayout["right-ribbon"];
 
-			// Convert relative paths back to absolute
-			this.makeLayoutPathsAbsolute(layoutObj, folder.path);
-
-			// Restore entire workspace
-			this.app.workspace.changeLayout(layoutObj);
-			new Notice("Layout opened.");
-		} catch (error) {
-			console.error(error);
-			new Notice("Could not open layout.");
-		}
+		this.app.workspace.changeLayout(newLayout);
 	}
 
-	/**
-	 * Default layout:
-	 * - If fewer than MAX_FILE_AMOUNT_TO_OPEN_AS_SPLIT_PANES, open them vertically.
-	 * - Otherwise, open them all in tabs in one pane.
-	 */
 	private async openDefaultLayout(folder: TFolder) {
 		const allFiles = this.getAllFilesRecursively(folder);
 		if (allFiles.length === 0) {
-			new Notice("No files found.");
+			new Notice("Folder has no files.");
 			return;
 		}
-
 		const leaf = this.app.workspace.getMostRecentLeaf();
 		if (!leaf) {
-			new Notice("No place to open files.");
+			new Notice("No active leaf.");
 			return;
 		}
-
-		if (allFiles.length < MAX_FILE_AMOUNT_TO_OPEN_AS_SPLIT_PANES) {
-			// Vertical splits (top-to-bottom stack)
+		if (allFiles.length < this.settings.defaultSplitThreshold) {
 			await leaf.openFile(allFiles[0]);
 			for (let i = 1; i < allFiles.length; i++) {
 				const newLeaf = this.app.workspace.splitActiveLeaf("vertical");
 				await newLeaf.openFile(allFiles[i]);
 			}
 		} else {
-			// Open them all as tabs in the same pane
 			await leaf.openFile(allFiles[0]);
 			for (let i = 1; i < allFiles.length; i++) {
 				await leaf.openFile(allFiles[i], { active: false });
@@ -172,7 +248,9 @@ export default class FolderWorkspacePlugin extends Plugin {
 		}
 	}
 
-	/** Close all Markdown leaves/tabs. */
+	//-----------------------------------------
+	// 4) Utility: close leaves, path transforms
+	//-----------------------------------------
 	private closeAllMarkdownLeaves() {
 		const leaves = this.app.workspace.getLeavesOfType("markdown");
 		for (const leaf of leaves) {
@@ -180,18 +258,13 @@ export default class FolderWorkspacePlugin extends Plugin {
 		}
 	}
 
-	/** Returns the file paths of all open Markdown tabs. */
 	private getOpenFilePaths(): string[] {
-		const result: string[] = [];
-		const leaves = this.app.workspace.getLeavesOfType("markdown");
-		for (const leaf of leaves) {
-			const file = leaf.view.file;
-			if (file) result.push(file.path);
-		}
-		return result;
+		return this.app.workspace
+			.getLeavesOfType("markdown")
+			.map((leaf) => leaf.view.file?.path)
+			.filter((p): p is string => !!p);
 	}
 
-	/** Recursively collect all TFile objects inside the given folder. */
 	private getAllFilesRecursively(folder: TFolder): TFile[] {
 		let result: TFile[] = [];
 		for (const child of folder.children) {
@@ -204,25 +277,14 @@ export default class FolderWorkspacePlugin extends Plugin {
 		return result;
 	}
 
-	//------------------------------------------------------------------
-	// Path Transformations: Absolute <--> Relative
-	//------------------------------------------------------------------
-
-	/**
-	 * Walk the layout object. Every time we see a leaf whose type is "markdown"
-	 * and has a "file", transform that file path from absolute to relative.
-	 */
 	private makeLayoutPathsRelative(layoutObj: any, folderPath: string) {
-		this._walkLayoutLeaves(layoutObj, (leaf) => {
+		this.walkLayoutLeaves(layoutObj, (leaf: any) => {
 			if (leaf?.state?.type === "markdown") {
 				const absPath = leaf.state.state?.file;
 				if (typeof absPath === "string") {
-					// If the file is inside folderPath, strip that prefix
 					if (absPath.startsWith(folderPath + "/")) {
-						const relativePath = absPath.slice(folderPath.length + 1);
-						leaf.state.state.file = relativePath;
+						leaf.state.state.file = absPath.slice(folderPath.length + 1);
 					} else {
-						// If file is outside the folder, we remove it or set it to null
 						leaf.state.state.file = null;
 					}
 				}
@@ -230,71 +292,90 @@ export default class FolderWorkspacePlugin extends Plugin {
 		});
 	}
 
-	/**
-	 * Walk the layout object. Every time we see a leaf whose type is "markdown"
-	 * and has a "file", transform that file path from relative to absolute (prefixed with folderPath).
-	 */
 	private makeLayoutPathsAbsolute(layoutObj: any, folderPath: string) {
-		this._walkLayoutLeaves(layoutObj, (leaf) => {
+		this.walkLayoutLeaves(layoutObj, (leaf: any) => {
 			if (leaf?.state?.type === "markdown") {
 				const relPath = leaf.state.state?.file;
 				if (typeof relPath === "string" && relPath.length > 0) {
-					// Convert relative path to absolute
 					leaf.state.state.file = folderPath + "/" + relPath;
 				}
 			}
 		});
 	}
 
-	/**
-	 * Utility to walk all leaves in the layout, calling a callback on each leaf.
-	 */
-	private _walkLayoutLeaves(layoutObj: any, leafCallback: (leaf: any) => void) {
-		if (!layoutObj) return;
-
-		if (layoutObj.type === "leaf") {
-			leafCallback(layoutObj);
-		} else if (layoutObj.children && Array.isArray(layoutObj.children)) {
-			for (const child of layoutObj.children) {
-				this._walkLayoutLeaves(child, leafCallback);
+	private walkLayoutLeaves(obj: any, callback: (leaf: any) => void) {
+		if (!obj) return;
+		if (obj.type === "leaf") {
+			callback(obj);
+		} else if (Array.isArray(obj.children)) {
+			for (const child of obj.children) {
+				this.walkLayoutLeaves(child, callback);
 			}
 		} else {
-			// Also handle left, right, etc. in the root layout object
-			if (layoutObj.main) {
-				this._walkLayoutLeaves(layoutObj.main, leafCallback);
-			}
-			if (layoutObj.left) {
-				this._walkLayoutLeaves(layoutObj.left, leafCallback);
-			}
-			if (layoutObj.right) {
-				this._walkLayoutLeaves(layoutObj.right, leafCallback);
-			}
-			if (layoutObj.center) {
-				this._walkLayoutLeaves(layoutObj.center, leafCallback);
-			}
+			if (obj.main) this.walkLayoutLeaves(obj.main, callback);
+			if (obj.left) this.walkLayoutLeaves(obj.left, callback);
+			if (obj.right) this.walkLayoutLeaves(obj.right, callback);
+			if (obj.center) this.walkLayoutLeaves(obj.center, callback);
 		}
 	}
 
-	//------------------------------------------------------------------
-	// Plugin Settings
-	//------------------------------------------------------------------
+	//-----------------------------------------
+	// 5) Force showing/hiding the left sidebar
+	//    by using existing "toggle left sidebar" command
+	//-----------------------------------------
+	private forceShowLeftSidebar() {
+		// If it's already open, do nothing
+		if (!this.isLeftSidebarOpen()) {
+			this.app.commands.executeCommandById("app:toggle-left-sidebar");
+		}
+	}
+
+	private forceHideLeftSidebar() {
+		// If it's currently open, toggle it to close
+		if (this.isLeftSidebarOpen()) {
+			this.app.commands.executeCommandById("app:toggle-left-sidebar");
+		}
+	}
+
+	/** 
+	 * Check if the left sidebar is currently open or collapsed.
+	 * We'll look at (this.app.workspace as any).leftSplit, or
+	 * see if we can glean from getLeftLeaf(false).
+	 */
+	private isLeftSidebarOpen(): boolean {
+		const leftSplit = (this.app.workspace as any).leftSplit;
+		if (!leftSplit) return false;
+		return leftSplit.collapsed === false;
+	}
+
+	//-----------------------------------------
+	// 6) Checking if the user is pressing the “sidebarHoldKey”
+	//-----------------------------------------
+	private isSidebarHoldKey(evt: KeyboardEvent): boolean {
+		switch (this.settings.sidebarHoldKey) {
+			case "alt":   return evt.altKey && !evt.metaKey;
+			case "mod":   return Keymap.isModEvent(evt);
+			case "shift": return evt.shiftKey;
+			case "ctrl":  return evt.ctrlKey && !evt.metaKey;
+		}
+		return false;
+	}
+
+	//-----------------------------------------
+	// 7) Settings load/save
+	//-----------------------------------------
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
-
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
 }
 
-/**
- * A simple settings tab with two drop-downs to change the hotkeys for
- * saving and opening layouts.
- */
-class FolderWorkspaceSettingTab extends PluginSettingTab {
-	plugin: FolderWorkspacePlugin;
+class FolderLayoutSettingTab extends PluginSettingTab {
+	plugin: FolderLayoutPlugin;
 
-	constructor(app: App, plugin: FolderWorkspacePlugin) {
+	constructor(app: App, plugin: FolderLayoutPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -302,42 +383,52 @@ class FolderWorkspaceSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		containerEl.createEl("h2", { text: "Folder Workspace Settings" });
+		containerEl.createEl("h2", { text: "Folder Layout Settings" });
 
-		// Options for hotkeys
-		const hotkeyOptions: Array<["alt"|"mod"|"shift"|"ctrl", string]> = [
-			["alt",   "Alt key"],
-			["mod",   "Ctrl/Cmd key"],
-			["shift", "Shift key"],
-			["ctrl",  "Ctrl key"]
-		];
-
-		// Setting: Open Layout Hotkey
+		// 1) Save Layout Key
 		new Setting(containerEl)
-			.setName("Open Layout Hotkey")
-			.setDesc("Choose which modifier key to use when clicking a folder to open its layout.")
-			.addDropdown(dropdown => {
-				hotkeyOptions.forEach(([value, label]) => {
-					dropdown.addOption(value, label);
-				});
-				dropdown.setValue(this.plugin.settings.openHotkey);
-				dropdown.onChange(async (value: "alt"|"mod"|"shift"|"ctrl") => {
-					this.plugin.settings.openHotkey = value;
+			.setName("Save Layout Key")
+			.setDesc("Which modifier key to hold when clicking a folder to save the layout.")
+			.addDropdown(drop => {
+				drop.addOption("alt", "Alt");
+				drop.addOption("mod", "Ctrl/Cmd");
+				drop.addOption("shift", "Shift");
+				drop.addOption("ctrl", "Ctrl");
+				drop.setValue(this.plugin.settings.saveModifier);
+				drop.onChange(async (val: any) => {
+					this.plugin.settings.saveModifier = val;
 					await this.plugin.saveSettings();
 				});
 			});
 
-		// Setting: Save Layout Hotkey
+		// 2) Vertical Split Threshold
 		new Setting(containerEl)
-			.setName("Save Layout Hotkey")
-			.setDesc("Choose which modifier key to use when clicking a folder to save its layout.")
-			.addDropdown(dropdown => {
-				hotkeyOptions.forEach(([value, label]) => {
-					dropdown.addOption(value, label);
-				});
-				dropdown.setValue(this.plugin.settings.saveHotkey);
-				dropdown.onChange(async (value: "alt"|"mod"|"shift"|"ctrl") => {
-					this.plugin.settings.saveHotkey = value;
+			.setName("Vertical Split Threshold")
+			.setDesc("Open up to this many files in vertical splits before switching to tabbed view.")
+			.addText(text => {
+				text
+					.setValue(this.plugin.settings.defaultSplitThreshold.toString())
+					.onChange(async val => {
+						const num = parseInt(val, 10);
+						if (!isNaN(num)) {
+							this.plugin.settings.defaultSplitThreshold = num;
+							await this.plugin.saveSettings();
+						}
+					});
+			});
+
+		// 3) Sidebar Hold Key
+		new Setting(containerEl)
+			.setName("Sidebar Hold Key")
+			.setDesc("Which modifier key to hold down to temporarily show the left sidebar.")
+			.addDropdown(drop => {
+				drop.addOption("alt", "Alt");
+				drop.addOption("mod", "Ctrl/Cmd");
+				drop.addOption("shift", "Shift");
+				drop.addOption("ctrl", "Ctrl");
+				drop.setValue(this.plugin.settings.sidebarHoldKey);
+				drop.onChange(async (val: any) => {
+					this.plugin.settings.sidebarHoldKey = val;
 					await this.plugin.saveSettings();
 				});
 			});
