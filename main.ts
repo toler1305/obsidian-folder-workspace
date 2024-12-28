@@ -1,55 +1,57 @@
-import { Plugin, TFile, TFolder, Keymap } from "obsidian";
+import { Plugin, TFolder, TFile, Keymap } from "obsidian";
 
-export default class CtrlClickOpenAllPlugin extends Plugin {
+export default class CtrlClickSplitOpenPlugin extends Plugin {
 	async onload() {
-		console.log("Loading CtrlClickOpenAllPlugin...");
+		console.log("Loading CtrlClickSplitOpenPlugin...");
 
-		// Listen for clicks anywhere in the DOM.
-		// If it's a ctrl/cmd-click on a folder in the file explorer, open all files.
 		this.registerDomEvent(document, "click", (evt: MouseEvent) => {
-			// Check if user is holding Ctrl/Cmd (on Mac, Cmd is also recognized as "mod").
-			if (!Keymap.isModEvent(evt)) return;
+			if (!Keymap.isModEvent(evt)) return; // Only respond to Ctrl/Cmd+click
 
-			// Attempt to find a folder element in the file explorer by climbing up the DOM.
-			const targetElement = evt.target as HTMLElement;
-			const folderTitleEl = targetElement?.closest(".nav-folder-title");
-			if (!folderTitleEl) return; // Not a folder
+			// Climb up the DOM to check if the clicked element is a folder in the explorer
+			const target = evt.target as HTMLElement;
+			const folderTitleEl = target?.closest(".nav-folder-title");
+			if (!folderTitleEl) return;
 
-			// The Obsidian file explorer sets 'data-path' on folder elements.
 			const folderPath = folderTitleEl.getAttribute("data-path");
-			if (!folderPath) return; // No recognized path
+			if (!folderPath) return;
 
-			// Check if the path corresponds to a folder. If so, open all child files.
 			const maybeFolder = this.app.vault.getAbstractFileByPath(folderPath);
 			if (maybeFolder instanceof TFolder) {
-				this.openAllFilesInFolder(maybeFolder);
-
-				// Prevent Obsidian from its default handling of ctrl-click on the folder.
+				// Prevent the default expand/collapse behavior
 				evt.preventDefault();
 				evt.stopPropagation();
+
+				this.openAllFilesInSplits(maybeFolder);
 			}
 		});
 	}
 
 	/**
-	 * Opens every file recursively inside the given folder.
+	 * Opens every file (including subfolders) in new, horizontally split panes.
 	 */
-	private openAllFilesInFolder(folder: TFolder): void {
-		// Recursively grab all TFile children in this folder
-		const files: TFile[] = this.getAllFilesRecursively(folder);
+	private openAllFilesInSplits(folder: TFolder) {
+		const allFiles = this.getAllFilesRecursively(folder);
 
-		// Use the built-in openLinkText or open a new leaf, etc.
-		for (const file of files) {
-			this.app.workspace.openLinkText(file.path, file.path);
+		if (allFiles.length === 0) return;
+
+		// Open the first file in the active pane
+		const activeLeaf = this.app.workspace.getMostRecentLeaf();
+		if (activeLeaf) {
+			activeLeaf.openFile(allFiles[0]);
+		}
+
+		// For the remaining files, create new split panes
+		for (let i = 1; i < allFiles.length; i++) {
+			const newLeaf = this.app.workspace.splitActiveLeaf("horizontal");
+			newLeaf.openFile(allFiles[i]);
 		}
 	}
 
 	/**
-	 * Recursively collects all TFile instances in a folder.
+	 * Recursively collect all TFile objects in `folder`.
 	 */
 	private getAllFilesRecursively(folder: TFolder): TFile[] {
 		let result: TFile[] = [];
-
 		for (const child of folder.children) {
 			if (child instanceof TFile) {
 				result.push(child);
@@ -57,11 +59,10 @@ export default class CtrlClickOpenAllPlugin extends Plugin {
 				result = result.concat(this.getAllFilesRecursively(child));
 			}
 		}
-
 		return result;
 	}
 
 	onunload() {
-		console.log("Unloading CtrlClickOpenAllPlugin.");
+		console.log("Unloading CtrlClickSplitOpenPlugin.");
 	}
 }
