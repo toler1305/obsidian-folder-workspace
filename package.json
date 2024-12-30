@@ -1,6 +1,6 @@
 {
 	"name": "folder-workspace",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "A plugin for Obsidian that allows you to save and open folder layouts.",
 	"main": "main.js",
 	"scripts": {
